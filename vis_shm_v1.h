@@ -2,7 +2,13 @@
  * LampaStream v1 SHM ABI — shared between squeezelite producer and Python consumer.
  *
  * This header defines the extension block appended immediately after the legacy
- * squeezelite vis_t header (at offset 80 = _HDR_OFFSET + _HDR_SIZE).
+ * squeezelite vis_t ``buffer`` array (at offset 32848 = 80 + sizeof(buffer)),
+ * i.e. at the very end of the mmap region rather than in the middle of it.
+ * This keeps every field a stock/unmodified consumer reads (rwlock, buf_size,
+ * buf_index, running, rate, updated, buffer) at the exact same offset as in
+ * unpatched upstream squeezelite, so a single build serves both that consumer
+ * and LampaStream's own v1 reader -- see the comment on ``struct vis_t`` in
+ * output_vis.c for why this is safe.
  *
  * Layout (40 bytes):
  *   offset  0: uint32_t magic         = VIS_SHM_V1_MAGIC (0x48555345 'HUSE')
@@ -40,10 +46,12 @@
 #define VIS_SHM_V1_MAGIC     UINT32_C(0x48555345)  /* 'HUSE' */
 #define VIS_SHM_V1_VERSION   UINT16_C(1)
 
-/* The extension block begins immediately after the legacy vis_t header. */
-#define VIS_SHM_V1_EXT_OFFSET 80U   /* = offsetof(vis_t, pthread_rwlock) + sizeof(pthread_rwlock_t) +
-                                        sizeof(buf_size) + sizeof(buf_index) + sizeof(running) +
-                                        sizeof(rate) + sizeof(updated) */
+/* The extension block begins immediately after the legacy vis_t ``buffer``
+ * array -- i.e. at the very end of the mmap region, not between the header
+ * and the buffer. */
+#define VIS_SHM_V1_EXT_OFFSET 32848U /* = 80 (legacy header: rwlock + buf_size + buf_index +
+                                         running + rate + updated, on Linux x86_64) +
+                                         16384 * sizeof(int16_t) (buffer) */
 
 typedef struct __attribute__((packed)) vis_shm_v1_ext {
     uint32_t magic;           /* VIS_SHM_V1_MAGIC */

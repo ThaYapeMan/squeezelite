@@ -30,7 +30,8 @@
 #include <fcntl.h>
 /* LampaStream v1 SHM producer extension.  The producer helpers live in
  * output_vis_v1.c; the header defines the extension block layout the
- * LampaStream consumer maps at offset 80. */
+ * LampaStream consumer maps at offset 32848 (immediately after the legacy
+ * buffer array). */
 #include "vis_shm_v1.h"
 #if OSX
 #include <mach/clock.h>
@@ -48,12 +49,17 @@ static int pthread_rwlock_timedwrlock( pthread_rwlock_t * restrict rwlock, const
 #define VIS_BUF_SIZE 16384
 #define VIS_LOCK_NS  1000000 // ns to wait for vis wrlock
 
-/* LampaStream v1: the extension block lives immediately after the legacy header
- * fields, at offset 80 of the mmap region.  ``buffer`` therefore starts at
- * offset 120 (= 80 + 40).  Consumers built against the v0 layout that expect
- * PCM at offset 80 will fail to decode the extension magic and either fall
- * back to a v0 read path or reject the segment — this is intentional: v1 is
- * an ABI break flagged by ``vis_shm_v1_ext_t.magic``. */
+/* LampaStream v1: the extension block is appended AFTER the legacy ``buffer``
+ * array, at offset 32848 (= 80 + sizeof(buffer)).  Every field an unmodified,
+ * stock-layout consumer (e.g. the external cava package's shmem input) reads
+ * -- rwlock, buf_size, buf_index, running, rate, updated, buffer -- therefore
+ * sits at exactly the same offset as in unpatched upstream squeezelite.  Such
+ * a consumer mmaps only ``sizeof(its own, stock vis_t)`` bytes, which is
+ * smaller than our extended segment; mmap happily maps a prefix of a larger
+ * shared-memory object, so the trailing extension block is simply never
+ * mapped by that consumer and never interferes with it. This lets a single
+ * build serve both the legacy/external consumer and LampaStream's own v1
+ * reader -- no separate unpatched build is required. */
 static struct vis_t {
 	pthread_rwlock_t rwlock;
 	u32_t buf_size;
@@ -61,8 +67,8 @@ static struct vis_t {
 	bool running;
 	u32_t rate;
 	time_t updated;
-	vis_shm_v1_ext_t lampastream_v1_ext;
 	s16_t buffer[VIS_BUF_SIZE];
+	vis_shm_v1_ext_t lampastream_v1_ext;
 } *vis_mmap = NULL;
 
 static char vis_shm_path[40];

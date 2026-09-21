@@ -28,6 +28,10 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+/* LampaStream v1 SHM producer extension.  The producer helpers live in
+ * output_vis_v1.c; the header defines the extension block layout the
+ * LampaStream consumer maps at offset 80. */
+#include "vis_shm_v1.h"
 #if OSX
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -44,6 +48,12 @@ static int pthread_rwlock_timedwrlock( pthread_rwlock_t * restrict rwlock, const
 #define VIS_BUF_SIZE 16384
 #define VIS_LOCK_NS  1000000 // ns to wait for vis wrlock
 
+/* LampaStream v1: the extension block lives immediately after the legacy header
+ * fields, at offset 80 of the mmap region.  ``buffer`` therefore starts at
+ * offset 120 (= 80 + 40).  Consumers built against the v0 layout that expect
+ * PCM at offset 80 will fail to decode the extension magic and either fall
+ * back to a v0 read path or reject the segment — this is intentional: v1 is
+ * an ABI break flagged by ``vis_shm_v1_ext_t.magic``. */
 static struct vis_t {
 	pthread_rwlock_t rwlock;
 	u32_t buf_size;
@@ -51,6 +61,7 @@ static struct vis_t {
 	bool running;
 	u32_t rate;
 	time_t updated;
+	vis_shm_v1_ext_t lampastream_v1_ext;
 	s16_t buffer[VIS_BUF_SIZE];
 } *vis_mmap = NULL;
 
@@ -89,16 +100,33 @@ void _vis_export(struct buffer *outputbuf, struct outputstate *output, frames_t 
 		
 		if (err) {
 			LOG_DEBUG("failed to get wrlock - skipping visulizer export");
-			
+			/* LampaStream v1: producer failed to acquire the export lock; record
+			 * the skipped block so the consumer's gap_seq detector fires.
+			 * The counter is buffered inside the producer and published on
+			 * the next successful end_write pair. */
+			vis_shm_v1_record_gap(&vis_mmap->lampastream_v1_ext);
 		} else {
 			
 			if (silence) {
+				/* LampaStream v1: silence transition changes ``running``, which
+				 * the consumer treats as part of the coherent snapshot.
+				 * Wrap the write in the seqlock pair so a racing reader
+				 * cannot observe stale abs_write_pos alongside the new
+				 * running=false marker. */
+				vis_shm_v1_begin_write(&vis_mmap->lampastream_v1_ext);
 				vis_mmap->running = false;
+				vis_shm_v1_end_write(&vis_mmap->lampastream_v1_ext, 0);
 			} else {
 				frames_t vis_cnt = out_frames;
 				s32_t *ptr = (s32_t *) outputbuf->readp;
 				unsigned i = vis_mmap->buf_index;
-				
+				frames_t n_stereo_frames = out_frames;
+
+				/* LampaStream v1: mark the export as in-progress under the
+				 * seqlock so a racing consumer sees an odd write_seq and
+				 * retries.  End the pair after buf_index / updated / rate
+				 * have all been published. */
+				vis_shm_v1_begin_write(&vis_mmap->lampastream_v1_ext);
 				if (!output->current_replay_gain) {
 					while (vis_cnt--) {
 						vis_mmap->buffer[i++] = *(ptr++) >> 16;
@@ -117,6 +145,11 @@ void _vis_export(struct buffer *outputbuf, struct outputstate *output, frames_t 
 				vis_mmap->running = true;
 				vis_mmap->buf_index = i;
 				vis_mmap->rate = output->current_sample_rate;
+				/* LampaStream v1: publish abs_write_pos + gap_seq and flip
+				 * write_seq back to even.  n_stereo_frames matches the
+				 * scalar samples we just placed into ``buffer``. */
+				vis_shm_v1_end_write(&vis_mmap->lampastream_v1_ext,
+				                    (uint64_t)n_stereo_frames);
 			}
 			
 			pthread_rwlock_unlock(&vis_mmap->rwlock);
@@ -127,7 +160,12 @@ void _vis_export(struct buffer *outputbuf, struct outputstate *output, frames_t 
 void vis_stop(void) {
 	if (vis_mmap) {
 		pthread_rwlock_wrlock(&vis_mmap->rwlock);
+		/* LampaStream v1: stop transition changes ``running``.  Wrap it in the
+		 * seqlock pair so consumers never observe a partial state (running
+		 * false, abs_write_pos still advancing) between the two writes. */
+		vis_shm_v1_begin_write(&vis_mmap->lampastream_v1_ext);
 		vis_mmap->running = false;
+		vis_shm_v1_end_write(&vis_mmap->lampastream_v1_ext, 0);
 		pthread_rwlock_unlock(&vis_mmap->rwlock);
 	}
 }
@@ -155,11 +193,34 @@ void output_vis_init(log_level level, u8_t *mac) {
 		pthread_rwlockattr_init(&attr);
 		pthread_rwlockattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
 		pthread_rwlock_init(&vis_mmap->rwlock, &attr);
+		/* LampaStream v1: force write_seq to an ODD value BEFORE mutating any
+		 * snapshot field.  shm_open(O_CREAT | O_RDWR) may reuse an existing
+		 * SHM segment, so mmap does NOT necessarily zero write_seq — a
+		 * naive fetch_add(1) would happily flip an already-odd value to
+		 * even, publishing an in-progress init as 'stable'.  begin_init
+		 * reads the current value and stores the smallest odd value
+		 * strictly greater than it. */
+		vis_shm_v1_begin_init(&vis_mmap->lampastream_v1_ext);
 		vis_mmap->buf_size = VIS_BUF_SIZE;
 		vis_mmap->running = false;
 		vis_mmap->rate = 44100;
 		pthread_rwlockattr_destroy(&attr);
-		LOG_INFO("opened visulizer shared memory as %s", vis_shm_path);
+		/* LampaStream v1: finish init — populate the extension block and flip
+		 * write_seq to an even value.  A -1 return means both getrandom(2)
+		 * and /dev/urandom were unavailable — abort SHM setup rather than
+		 * fall back to a PID/time generation, which would collide across
+		 * restarts and defeat consumer restart detection. */
+		if (vis_shm_v1_finish_init(&vis_mmap->lampastream_v1_ext) != 0) {
+			LOG_WARN("LampaStream v1 SHM init failed (no RNG); disabling visualiser SHM");
+			munmap(vis_mmap, sizeof(struct vis_t));
+			vis_mmap = NULL;
+			close(vis_fd);
+			vis_fd = -1;
+			shm_unlink(vis_shm_path);
+			umask(old_mask);
+			return;
+		}
+		LOG_INFO("opened visulizer shared memory as %s (LampaStream v1 ABI)", vis_shm_path);
 	} else {
 		LOG_WARN("unable to open visualizer shared memory");
 		vis_mmap = NULL;
